@@ -1,0 +1,161 @@
+name: Product CI Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Lay ma nguon
+        uses: actions/checkout@v6
+
+      - name: Cai Node.js cho script test
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Chuan bi cau hinh tren may ao
+        run: |
+          cat > .env.docker <<'ENV'
+          PORT=3000
+          MONGO_URI=mongodb://nammongodb:27017/productdb
+          ENV
+
+          docker volume create nammongodb_data
+          docker compose config -q
+
+      - name: Build va cho MongoDB + API healthy
+        run: |
+          docker compose up -d --build --wait --wait-timeout 180
+          docker compose ps
+
+      - name: Test healthcheck va CRUD Product
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+
+          const base = "http://127.0.0.1:3000";
+
+          async function request(method, path, expectedStatus, body) {
+            const response = await fetch(base + path, {
+              method,
+              headers: body === undefined
+                ? {}
+                : { "Content-Type": "application/json" },
+              body: body === undefined ? undefined : JSON.stringify(body),
+              signal: AbortSignal.timeout(10000)
+            });
+
+            const text = await response.text();
+
+            assert.equal(
+              response.status,
+              expectedStatus,
+              `${method} ${path}: expected ${expectedStatus}, got ${response.status}: ${text}`
+            );
+
+            console.log(`PASS: ${method} ${path} -> ${expectedStatus}`);
+            return text ? JSON.parse(text) : null;
+          }
+
+          function checkProduct(actual, expected) {
+            for (const key of ["pid", "pname", "price", "quantity"]) {
+              assert.equal(actual[key], expected[key], `Sai gia tri ${key}`);
+            }
+          }
+
+          // 1. API phan hoi va ket noi duoc MongoDB
+          const health = await request("GET", "/health", 200);
+          assert.equal(health.status, "healthy");
+          assert.equal(health.mongodb, "connected");
+
+          const product = {
+            pid: "CI001",
+            pname: "San pham test CI",
+            price: 100000,
+            quantity: 5
+          };
+
+          const path = "/api/products/" + product.pid;
+
+          // 2. CREATE: tao san pham
+          const created = await request("POST", "/api/products", 201, product);
+          checkProduct(created, product);
+
+          // 3. READ: doc mot san pham va danh sach
+          checkProduct(await request("GET", path, 200), product);
+
+          const list = await request("GET", "/api/products", 200);
+          assert.ok(Array.isArray(list));
+          assert.ok(list.some(item => item.pid === product.pid));
+
+          // 4. Khong cho phep trung pid
+          await request("POST", "/api/products", 409, product);
+
+          // 5. Tu choi du lieu khong hop le
+          const invalidCases = [
+            { ...product, pid: "" },
+            { ...product, pname: "" },
+            { ...product, price: -1 },
+            { ...product, quantity: 1.5 }
+          ];
+
+          for (const invalid of invalidCases) {
+            await request("POST", "/api/products", 400, invalid);
+          }
+
+          // 6. UPDATE: cap nhat va doc lai tu MongoDB
+          const updated = {
+            ...product,
+            pname: "San pham da cap nhat",
+            price: 150000,
+            quantity: 10
+          };
+
+          checkProduct(await request("PUT", path, 200, updated), updated);
+          checkProduct(await request("GET", path, 200), updated);
+
+          // 7. PUT khong hop le khong duoc thay doi du lieu
+          await request("PUT", path, 400, { ...updated, price: -1 });
+          checkProduct(await request("GET", path, 200), updated);
+
+          // 8. San pham khong ton tai
+          await request("GET", "/api/products/NOT_FOUND", 404);
+          await request("PUT", "/api/products/NOT_FOUND", 404, updated);
+          await request("DELETE", "/api/products/NOT_FOUND", 404);
+
+          // 9. DELETE: xoa va xac nhan da xoa
+          await request("DELETE", path, 200);
+          await request("GET", path, 404);
+          await request("DELETE", path, 404);
+
+          const remaining = await request("GET", "/api/products", 200);
+          assert.ok(!remaining.some(item => item.pid === product.pid));
+
+          // 10. Kiem tra suc khoe sau khi test
+          const finalHealth = await request("GET", "/health", 200);
+          assert.equal(finalHealth.mongodb, "connected");
+
+          console.log("PASS: ALL PRODUCT INTEGRATION TESTS");
+          NODE
+
+      - name: Hien thi trang thai va logs
+        if: always()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=100
+
+      - name: Don dep container tren may ao
+        if: always()
+        run: docker compose down
