@@ -149,6 +149,25 @@ jobs:
 
           console.log("PASS: ALL PRODUCT INTEGRATION TESTS");
           NODE
+      - name: Dang nhap Docker Hub
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image da test len Docker Hub
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          IMAGE="${DOCKERHUB_USERNAME}/product-api"
+
+          docker tag product-api:1.0 "${IMAGE}:sha-${GITHUB_SHA}"
+          docker tag product-api:1.0 "${IMAGE}:latest"
+
+          docker push "${IMAGE}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
 
       - name: Hien thi trang thai va logs
         if: always()
